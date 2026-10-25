@@ -1766,6 +1766,8 @@ pub(crate) unsafe fn playback_tick(app: &mut App, fr: &mut Frame) {
                 fr.now,
             );
         }
+        #[cfg(all(feature = "devtriggers", not(feature = "hostsim"), not(test)))]
+        plx_media::theme::spike::poll(plx_media::player::preview::view().playing);
         // **The ONE place the Player machine is asked whether the hardware video plane is bound**
         // (spec §9), immediately after the pump that advances the ACB bind transaction and BEFORE
         // the container tree's frame, so the whole iteration reads one answer. Outside the

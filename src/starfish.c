@@ -740,11 +740,18 @@ int sf_set_content_info(long long position_ns) {
     return 1;
 }
 
+static char sf_feed_object(void *object, const unsigned char *p, unsigned size, long long pts,
+                           int esData);
+
 /* Feed one AU; hides the sret std::string (SSO char* at offset 0). 'O'/'B'/'e'. */
 char sf_feed(const unsigned char *p, unsigned size, long long pts, int esData) {
     /* The only verb that used to dispatch with NO readiness check — it relied entirely on
        pump.rs returning early. Guard it here too so the object can never be fed mid-ctor. */
-    void *object = sf_ready_object();
+    return sf_feed_object(sf_ready_object(), p, size, pts, esData);
+}
+
+static char sf_feed_object(void *object, const unsigned char *p, unsigned size, long long pts,
+                           int esData) {
     if (!object) return 'e';
     pthread_once(&g_feed_once, sf_resolve_feed_once);
     if (!g_feed) return 'e';
@@ -770,6 +777,153 @@ char sf_feed(const unsigned char *p, unsigned size, long long pts, int esData) {
 int sf_feed_abi_is_cow(void) {
     pthread_once(&g_feed_once, sf_resolve_feed_once);
     return g_feed_cow;
+}
+
+/* ---- Theme music: a SECOND, audio-only Starfish object ----
+ *
+ * Independent of g_current: no video plane, no ACB, no window, no seek. Its slot joins the same
+ * registry, so the callbackFunctionHook interposer gates its callbacks exactly as it gates the
+ * video object's, and like every slot it is never freed or reused (the address is the only
+ * identity a late libpf thunk carries). Every sf_theme_* verb is called from ONE thread at a time
+ * (the Rust theme owner); the seam keeps no lock of its own for them, as for the video verbs.
+ *
+ * A theme slot that cannot be proven safe to destroy is abandoned (never D1'd), and theme music is
+ * then refused for the rest of the process; it never touches g_lifecycle_blocked on its own
+ * account, so a theme failure cannot stop the video pipeline. */
+static SfSlot *g_theme;
+static volatile int g_theme_ready;     /* the real Load returned: the object is dispatchable */
+static volatile int g_theme_blocked;   /* a theme object was abandoned: no further theme Load */
+
+static void sf_theme_cb(int type, long long num, const char *str, void *ctx) {
+    unsigned int epoch = (unsigned int)(uintptr_t)ctx;
+    SfSlot *slot = __atomic_load_n(&g_theme, __ATOMIC_ACQUIRE);
+    if (type == 23 && slot && slot->epoch == epoch)
+        __atomic_store_n(&slot->unload_completed, 1, __ATOMIC_RELEASE);
+    sf_theme_on_event(epoch, type, num, str);
+}
+
+static void *sf_theme_object(void) {
+    SfSlot *slot = __atomic_load_n(&g_theme, __ATOMIC_ACQUIRE);
+    return slot && __atomic_load_n(&g_theme_ready, __ATOMIC_ACQUIRE) ? slot->object : NULL;
+}
+
+int sf_theme_load(const char *payload, unsigned int epoch) {
+    if (!payload || epoch == 0 || __atomic_load_n(&g_theme_blocked, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&g_lifecycle_blocked, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&g_theme, __ATOMIC_ACQUIRE) || !sf_prepare_callback_hook()) {
+        if (elogf) {
+            fprintf(elogf, "theme lifecycle: Load refused blocked=%d current=%p epoch=%u\n",
+                    __atomic_load_n(&g_theme_blocked, __ATOMIC_ACQUIRE),
+                    (void *)__atomic_load_n(&g_theme, __ATOMIC_ACQUIRE), epoch);
+            fflush(elogf);
+        }
+        return 0;
+    }
+    SfSlot *slot = NULL;
+    if (posix_memalign((void **)&slot, 16, sizeof *slot) == 0) memset(slot, 0, sizeof *slot);
+    if (!slot || pthread_mutex_init(&slot->gate, NULL) != 0 ||
+        pthread_cond_init(&slot->drained, NULL) != 0) {
+        __atomic_store_n(&g_theme_blocked, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    slot->epoch = epoch;
+    slot->active = 1;
+    if (pthread_mutex_lock(&g_slots_lock) != 0) {
+        __atomic_store_n(&g_theme_blocked, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    slot->next = g_slots;
+    g_slots = slot;
+    if (pthread_mutex_unlock(&g_slots_lock) != 0) {
+        __atomic_store_n(&g_theme_blocked, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    __atomic_store_n(&g_theme_ready, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_theme, slot, __ATOMIC_RELEASE);
+    SMP_ctor(slot->object, NULL);
+    if (pthread_mutex_lock(&slot->gate) != 0) {
+        __atomic_store_n(&g_theme_blocked, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    slot->evidence_armed = 1;
+    if (pthread_mutex_unlock(&slot->gate) != 0) {
+        __atomic_store_n(&g_theme_blocked, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    /* No notifyForeground: the video object owns the app's foreground registration, and a second
+       call is not known to be harmless to it. */
+    int ok = g_load_with_context(slot->object, payload, sf_theme_cb, (void *)(uintptr_t)epoch);
+    __atomic_store_n(&g_theme_ready, 1, __ATOMIC_RELEASE);
+    if (elogf) {
+        fprintf(elogf, "theme lifecycle: Load epoch=%u object=%p ok=%d\n", epoch,
+                (void *)slot->object, ok);
+        fflush(elogf);
+    }
+    return ok;
+}
+int sf_theme_play(void) {
+    void *object = sf_theme_object();
+    return object ? SMP_Play(object) : 0;
+}
+int sf_theme_set_volume(int volume) {
+    void *object = sf_theme_object();
+    if (!object) return 0;
+    char json[32];
+    snprintf(json, sizeof json, "{\"volume\":%d}", volume);
+    return SMP_setVolume(object, json) & 0xff;
+}
+char sf_theme_feed(const unsigned char *p, unsigned size, long long pts) {
+    return sf_feed_object(sf_theme_object(), p, size, pts, 2 /* audio */);
+}
+int sf_theme_push_eos(void) {
+    void *object = sf_theme_object();
+    return object ? SMP_pushEOS(object) : 0;
+}
+void sf_theme_unload(void) {
+    void *object = sf_theme_object();
+    if (object) SMP_Unload(object);
+}
+int sf_theme_unload_completed(void) {
+    SfSlot *slot = __atomic_load_n(&g_theme, __ATOMIC_ACQUIRE);
+    return slot ? __atomic_load_n(&slot->unload_completed, __ATOMIC_ACQUIRE) : 1;
+}
+/* Close the theme slot's callback gate, then destroy the object when that is provably safe (the
+   same predicate as sf_destroy). Otherwise the object is abandoned and theme music is refused for
+   the rest of the process. Either way the slot is released for nothing: 1 = destroyed. */
+int sf_theme_release(void) {
+    SfSlot *slot = __atomic_load_n(&g_theme, __ATOMIC_ACQUIRE);
+    if (!slot) return 1;
+    __atomic_store_n(&g_theme_ready, 0, __ATOMIC_RELEASE);
+    int safe = 0;
+    if (pthread_mutex_lock(&slot->gate) == 0) {
+        slot->active = 0;
+        int drained = 1;
+        while (slot->inflight != 0) {
+            if (pthread_cond_wait(&slot->drained, &slot->gate) != 0) { drained = 0; break; }
+        }
+        slot->gate_retired = drained && slot->inflight == 0;
+        safe = slot->gate_retired &&
+               __atomic_load_n(&slot->intercepted, __ATOMIC_RELAXED) != 0 &&
+               __atomic_load_n(&slot->unload_completed, __ATOMIC_ACQUIRE) &&
+               __atomic_load_n(&g_hook_valid, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&g_lifecycle_blocked, __ATOMIC_ACQUIRE);
+        if (pthread_mutex_unlock(&slot->gate) != 0) safe = 0;
+    }
+    if (safe) {
+        SMP_dtor(slot->object);
+        __atomic_store_n(&slot->destroyed, 1, __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&g_theme_blocked, 1, __ATOMIC_RELEASE);
+    }
+    if (elogf) {
+        fprintf(elogf, "theme lifecycle: release epoch=%u intercepted=%u unload_completed=%d %s\n",
+                slot->epoch, __atomic_load_n(&slot->intercepted, __ATOMIC_RELAXED),
+                __atomic_load_n(&slot->unload_completed, __ATOMIC_ACQUIRE),
+                safe ? "destroyed" : "ABANDONED; theme music disabled");
+        fflush(elogf);
+    }
+    __atomic_store_n(&g_theme, NULL, __ATOMIC_RELEASE);
+    return safe;
 }
 
 /* ---- ACB verbs (the 3-arg taskId ABI is hidden) ----

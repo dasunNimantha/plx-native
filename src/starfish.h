@@ -70,7 +70,17 @@ void acb_start(long x, long y, long w, long h);            /* setDisplayWindow +
 void acb_unload(void);                                     /* setState(UNLOADED) */
 
 /* ---- library-thread callbacks the seam forwards to (consumer-defined) ---- */
+/* Theme music: a second, audio-only object (no plane, no ACB); see src/starfish.c. */
+int  sf_theme_load(const char *payload, unsigned int epoch);
+int  sf_theme_play(void);
+int  sf_theme_set_volume(int volume);
+char sf_theme_feed(const unsigned char *p, unsigned size, long long pts); /* audio AU; 'O'/'B'/'e' */
+int  sf_theme_push_eos(void);
+void sf_theme_unload(void);
+int  sf_theme_unload_completed(void);  /* 1 once the theme object's UnloadCompleted arrived */
+int  sf_theme_release(void);           /* retire the gate, destroy when safe; 1 = destroyed */
 void sf_on_event(unsigned int epoch, int type, long long num, const char *str);
+void sf_theme_on_event(unsigned int epoch, int type, long long num, const char *str);
 void acb_on_event(long ev, const char *reply);
 
 #endif /* PLXNATIVE_STARFISH_H */
